@@ -1,0 +1,430 @@
+import { pool } from "./db";
+
+export interface AtsResult {
+  score: number;
+  label: string;
+  grade?: string;
+  matched_skills: string[];
+  missing_skills: string[];
+  /** Graph-traversal matches — skills covered via related/prerequisite nodes in the skill graph */
+  inferred_skills: string[];
+  skill_coverage: number;
+  keyword_coverage?: number;
+  domain: string;
+  explanation: string;
+  overall_summary?: string;
+  strengths?: string[];
+  risks?: string[];
+  interview_focus?: {
+    must_probe: string[];
+    strengths_to_confirm: string[];
+    suggested_question_themes: string[];
+    recommended_depth: string;
+  } | null;
+  _source?: string;
+}
+
+export interface Interview {
+  id: string;
+  resume: string;
+  resumeFileName: string;
+  candidateEmail: string;
+  candidateName?: string;
+  candidatePhone?: string;
+  token: string;
+  browserFingerprint: string | null;
+  role: string;
+  level: string;
+  focusAreas: string[];
+  duration: number;
+  roundType?: string;
+  language?: string;
+  status: "waiting" | "in_progress" | "completed";
+  transcript: TranscriptEntry[];
+  proctoring: ProctoringEvent[];
+  scorecard: Scorecard | null;
+  createdAt: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  expiresAt: string | null;
+  orgId?: string;
+  createdBy?: string;
+  hasRecording?: boolean;
+  atsScore?: number | null;
+  atsLabel?: string | null;
+  atsResult?: AtsResult | null;
+  atsDomain?: string | null;
+  taskId?: string | null;
+  taskDeadlineAt?: string | null;
+  taskSubmittedAt?: string | null;
+  taskEvalRepoUrl?: string | null;
+  taskEvalId?: string | null;
+  taskEvalStatus?: string | null;
+  taskEvalScore?: number | null;
+  taskEvalGrade?: string | null;
+  taskEvalResult?: Record<string, unknown> | null;
+  hiringDecision?: "selected" | "rejected" | null;
+  hiringDecisionAt?: string | null;
+  hiringDecisionBy?: string | null;
+}
+
+export interface TranscriptEntry {
+  role: "ai" | "candidate";
+  text: string;
+  timestamp: string;
+}
+
+export interface ProctoringEvent {
+  type: string;
+  severity: string;
+  message: string;
+  timestamp: string;
+  photo?: string;
+}
+
+export interface Scorecard {
+  scores: { dimension: string; score: number }[];
+  overall: number;
+  recommendation: string;
+  overallAssessment: string;
+  strengths: string[];
+  weaknesses: string[];
+  evidence: { dimension: string; quote: string; assessment: string }[];
+  proctoringNotes: string;
+}
+
+export async function saveInterview(interview: Omit<Interview, "transcript" | "proctoring">): Promise<void> {
+  await pool.query(
+    `INSERT INTO interviews (id, resume, resume_file_name, candidate_email, candidate_name, candidate_phone, token, browser_fingerprint, role, level, focus_areas, duration, round_type, language, status, scorecard, created_at, started_at, ended_at, expires_at, org_id, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+     ON CONFLICT (id) DO UPDATE SET
+       status = EXCLUDED.status,
+       scorecard = EXCLUDED.scorecard,
+       started_at = EXCLUDED.started_at,
+       ended_at = EXCLUDED.ended_at,
+       browser_fingerprint = COALESCE(EXCLUDED.browser_fingerprint, interviews.browser_fingerprint)`,
+    [
+      interview.id,
+      interview.resume,
+      interview.resumeFileName,
+      interview.candidateEmail,
+      interview.candidateName || null,
+      interview.candidatePhone || null,
+      interview.token,
+      interview.browserFingerprint,
+      interview.role,
+      interview.level,
+      interview.focusAreas,
+      interview.duration,
+      interview.roundType || "General",
+      interview.language || null,
+      interview.status,
+      interview.scorecard ? JSON.stringify(interview.scorecard) : null,
+      interview.createdAt,
+      interview.startedAt,
+      interview.endedAt,
+      interview.expiresAt,
+      interview.orgId || null,
+      interview.createdBy || null,
+    ]
+  );
+}
+
+export async function getInterview(id: string): Promise<Interview | null> {
+  const { rows } = await pool.query(
+    "SELECT *, (recording_data IS NOT NULL) AS has_recording FROM interviews WHERE id = $1",
+    [id]
+  );
+  if (rows.length === 0) return null;
+
+  const row = rows[0];
+  const transcript = await getTranscript(id);
+  const proctoring = await getProctoringEvents(id);
+
+  return {
+    id: row.id,
+    resume: row.resume,
+    resumeFileName: row.resume_file_name,
+    candidateEmail: row.candidate_email || "",
+    candidateName: row.candidate_name || "",
+    candidatePhone: row.candidate_phone || "",
+    token: row.token || "",
+    browserFingerprint: row.browser_fingerprint || null,
+    role: row.role,
+    level: row.level,
+    focusAreas: row.focus_areas,
+    duration: row.duration,
+    roundType: row.round_type || "General",
+    language: row.language || "",
+    status: row.status,
+    transcript,
+    proctoring,
+    scorecard: row.scorecard,
+    hasRecording: row.has_recording === true,
+    createdAt: row.created_at?.toISOString(),
+    startedAt: row.started_at?.toISOString() || null,
+    endedAt: row.ended_at?.toISOString() || null,
+    expiresAt: row.expires_at?.toISOString() || null,
+    orgId: row.org_id || null,
+    createdBy: row.created_by || null,
+    atsScore: row.ats_score ?? null,
+    atsLabel: row.ats_label ?? null,
+    atsResult: row.ats_result ?? null,
+    atsDomain: row.ats_domain ?? null,
+    taskId: row.task_id ?? null,
+    taskDeadlineAt: row.task_deadline_at?.toISOString() ?? null,
+    taskSubmittedAt: row.task_submitted_at?.toISOString() ?? null,
+    taskEvalRepoUrl: row.task_eval_repo_url ?? null,
+    taskEvalId: row.task_eval_id ?? null,
+    taskEvalStatus: row.task_eval_status ?? null,
+    taskEvalScore: row.task_eval_score ?? null,
+    taskEvalGrade: row.task_eval_grade ?? null,
+    taskEvalResult: row.task_eval_result ?? null,
+    hiringDecision: row.hiring_decision ?? null,
+    hiringDecisionAt: row.hiring_decision_at?.toISOString() ?? null,
+    hiringDecisionBy: row.hiring_decision_by ?? null,
+  };
+}
+
+export async function getInterviewWithPhotos(id: string): Promise<Interview | null> {
+  const { rows } = await pool.query(
+    "SELECT *, (recording_data IS NOT NULL) AS has_recording FROM interviews WHERE id = $1",
+    [id]
+  );
+  if (rows.length === 0) return null;
+
+  const row = rows[0];
+  const transcript = await getTranscript(id);
+  const proctoring = await getProctoringEventsWithPhotos(id);
+
+  return {
+    id: row.id,
+    resume: row.resume,
+    resumeFileName: row.resume_file_name,
+    candidateEmail: row.candidate_email || "",
+    candidateName: row.candidate_name || "",
+    candidatePhone: row.candidate_phone || "",
+    token: row.token || "",
+    browserFingerprint: row.browser_fingerprint || null,
+    role: row.role,
+    level: row.level,
+    focusAreas: row.focus_areas,
+    duration: row.duration,
+    roundType: row.round_type || "General",
+    language: row.language || "",
+    status: row.status,
+    transcript,
+    proctoring,
+    scorecard: row.scorecard,
+    hasRecording: row.has_recording === true,
+    createdAt: row.created_at?.toISOString(),
+    startedAt: row.started_at?.toISOString() || null,
+    endedAt: row.ended_at?.toISOString() || null,
+    expiresAt: row.expires_at?.toISOString() || null,
+    orgId: row.org_id || null,
+    createdBy: row.created_by || null,
+    atsScore: row.ats_score ?? null,
+    atsLabel: row.ats_label ?? null,
+    atsResult: row.ats_result ?? null,
+    atsDomain: row.ats_domain ?? null,
+    taskId: row.task_id ?? null,
+    taskDeadlineAt: row.task_deadline_at?.toISOString() ?? null,
+    taskSubmittedAt: row.task_submitted_at?.toISOString() ?? null,
+    taskEvalRepoUrl: row.task_eval_repo_url ?? null,
+    taskEvalId: row.task_eval_id ?? null,
+    taskEvalStatus: row.task_eval_status ?? null,
+    taskEvalScore: row.task_eval_score ?? null,
+    taskEvalGrade: row.task_eval_grade ?? null,
+    taskEvalResult: row.task_eval_result ?? null,
+    hiringDecision: row.hiring_decision ?? null,
+    hiringDecisionAt: row.hiring_decision_at?.toISOString() ?? null,
+    hiringDecisionBy: row.hiring_decision_by ?? null,
+  };
+}
+
+export async function updateInterview(id: string, updates: Partial<Interview>): Promise<void> {
+  const setClauses: string[] = [];
+  const values: any[] = [];
+  let idx = 1;
+
+  const columnMap: Record<string, string> = {
+    status: "status",
+    startedAt: "started_at",
+    endedAt: "ended_at",
+    scorecard: "scorecard",
+    browserFingerprint: "browser_fingerprint",
+    scoringStatus: "scoring_status",
+    scoringStartedAt: "scoring_started_at",
+    recordingUrl: "recording_url",
+    atsScore: "ats_score",
+    atsLabel: "ats_label",
+    atsResult: "ats_result",
+    atsDomain: "ats_domain",
+    taskId: "task_id",
+    taskDeadlineAt: "task_deadline_at",
+    taskSubmittedAt: "task_submitted_at",
+    taskEvalRepoUrl: "task_eval_repo_url",
+    taskEvalId: "task_eval_id",
+    taskEvalStatus: "task_eval_status",
+    taskEvalScore: "task_eval_score",
+    taskEvalGrade: "task_eval_grade",
+    taskEvalResult: "task_eval_result",
+  };
+
+  const jsonColumns = new Set(["scorecard", "ats_result", "task_eval_result"]);
+
+  for (const [key, col] of Object.entries(columnMap)) {
+    if (key in updates) {
+      setClauses.push(`${col} = $${idx}`);
+      const val = (updates as any)[key];
+      values.push(jsonColumns.has(col) ? JSON.stringify(val) : val);
+      idx++;
+    }
+  }
+
+  if (setClauses.length === 0) return;
+
+  values.push(id);
+  await pool.query(`UPDATE interviews SET ${setClauses.join(", ")} WHERE id = $${idx}`, values);
+}
+
+async function getTranscript(interviewId: string): Promise<TranscriptEntry[]> {
+  const { rows } = await pool.query(
+    "SELECT role, text, created_at FROM transcript_entries WHERE interview_id = $1 ORDER BY id ASC",
+    [interviewId]
+  );
+  return rows.map((r) => ({
+    role: r.role as "ai" | "candidate",
+    text: r.text,
+    timestamp: r.created_at?.toISOString(),
+  }));
+}
+
+async function getProctoringEvents(interviewId: string): Promise<ProctoringEvent[]> {
+  const { rows } = await pool.query(
+    "SELECT type, severity, message, created_at FROM proctoring_events WHERE interview_id = $1 ORDER BY id ASC",
+    [interviewId]
+  );
+  return rows.map((r) => ({
+    type: r.type,
+    severity: r.severity,
+    message: r.message,
+    timestamp: r.created_at?.toISOString(),
+  }));
+}
+
+async function getProctoringEventsWithPhotos(interviewId: string): Promise<ProctoringEvent[]> {
+  const { rows } = await pool.query(
+    "SELECT type, severity, message, photo, created_at FROM proctoring_events WHERE interview_id = $1 ORDER BY id ASC",
+    [interviewId]
+  );
+  return rows.map((r) => ({
+    type: r.type,
+    severity: r.severity,
+    message: r.message,
+    timestamp: r.created_at?.toISOString(),
+    ...(r.photo ? { photo: `data:image/webp;base64,${Buffer.isBuffer(r.photo) ? r.photo.toString("base64") : r.photo}` } : {}),
+  }));
+}
+
+export async function getProctoringViolationCount(interviewId: string): Promise<number> {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(
+      CASE type
+        WHEN 'face_missing' THEN 0.5
+        WHEN 'eye_away' THEN 0.5
+        ELSE 1
+      END
+    ), 0) as weighted_count
+    FROM proctoring_events WHERE interview_id = $1 AND severity = 'flag'`,
+    [interviewId]
+  );
+  return parseFloat(rows[0].weighted_count);
+}
+
+export async function getAllInterviews(orgId?: string): Promise<Omit<Interview, "resume">[]> {
+  const interviewQuery = orgId
+    ? "SELECT i.*, (SELECT count(*) FROM proctoring_events p WHERE p.interview_id = i.id AND p.severity = 'flag') as flag_count, (SELECT count(*) FROM proctoring_events p WHERE p.interview_id = i.id AND p.severity = 'warning') as warning_count FROM interviews i WHERE i.org_id = $1 ORDER BY i.created_at DESC LIMIT 100"
+    : "SELECT i.*, (SELECT count(*) FROM proctoring_events p WHERE p.interview_id = i.id AND p.severity = 'flag') as flag_count, (SELECT count(*) FROM proctoring_events p WHERE p.interview_id = i.id AND p.severity = 'warning') as warning_count FROM interviews i ORDER BY i.created_at DESC LIMIT 100";
+  const { rows } = await pool.query(interviewQuery, orgId ? [orgId] : []);
+
+  if (rows.length === 0) return [];
+
+  // List endpoint only needs summary data — transcript and proctoring are fetched via getInterview for detail views
+  return rows.map((row) => ({
+    id: row.id,
+    resume: "",
+    resumeFileName: row.resume_file_name,
+    candidateEmail: row.candidate_email || "",
+    candidateName: row.candidate_name || "",
+    candidatePhone: row.candidate_phone || "",
+    token: "",
+    browserFingerprint: null,
+    role: row.role,
+    level: row.level,
+    focusAreas: row.focus_areas,
+    duration: row.duration,
+    roundType: row.round_type || "General",
+    language: row.language || "",
+    status: row.status,
+    transcript: [],
+    proctoring: [
+      ...Array.from({ length: parseInt(row.flag_count) || 0 }, () => ({ type: "flag", severity: "flag", message: "", timestamp: "" })),
+      ...Array.from({ length: parseInt(row.warning_count) || 0 }, () => ({ type: "warning", severity: "warning", message: "", timestamp: "" })),
+    ],
+    scorecard: row.scorecard,
+    createdAt: row.created_at?.toISOString(),
+    startedAt: row.started_at?.toISOString() || null,
+    endedAt: row.ended_at?.toISOString() || null,
+    expiresAt: row.expires_at?.toISOString() || null,
+    orgId: row.org_id || null,
+    createdBy: row.created_by || null,
+    atsScore: row.ats_score ?? null,
+    atsLabel: row.ats_label ?? null,
+    atsResult: null,
+    atsDomain: row.ats_domain ?? null,
+    taskId: row.task_id ?? null,
+    taskDeadlineAt: row.task_deadline_at?.toISOString() ?? null,
+    taskSubmittedAt: row.task_submitted_at?.toISOString() ?? null,
+    taskEvalStatus: row.task_eval_status ?? null,
+    taskEvalScore: row.task_eval_score ?? null,
+    taskEvalGrade: row.task_eval_grade ?? null,
+  }));
+}
+
+export async function getInterviewByToken(token: string): Promise<Interview | null> {
+  const { rows } = await pool.query("SELECT id FROM interviews WHERE token = $1", [token]);
+  if (rows.length === 0) return null;
+  return getInterview(rows[0].id);
+}
+
+export async function addTranscriptEntry(id: string, entry: TranscriptEntry): Promise<void> {
+  // Deduplicate: skip if the last entry for this interview has the same role+text
+  const { rows } = await pool.query(
+    "SELECT text FROM transcript_entries WHERE interview_id = $1 ORDER BY id DESC LIMIT 1",
+    [id]
+  );
+  if (rows.length > 0 && rows[0].text === entry.text) return;
+
+  await pool.query(
+    "INSERT INTO transcript_entries (interview_id, role, text) VALUES ($1, $2, $3)",
+    [id, entry.role, entry.text]
+  );
+}
+
+export async function addProctoringEvent(id: string, event: ProctoringEvent & { photo?: string | Buffer }): Promise<void> {
+  let photoData: Buffer | null = null;
+  if (event.photo) {
+    if (Buffer.isBuffer(event.photo)) {
+      photoData = event.photo;
+    } else if (typeof event.photo === "string") {
+      // Strip data URL prefix if present, then decode base64 to binary
+      const base64 = event.photo.replace(/^data:[^;]+;base64,/, "");
+      photoData = Buffer.from(base64, "base64");
+    }
+  }
+  await pool.query(
+    "INSERT INTO proctoring_events (interview_id, type, severity, message, photo) VALUES ($1, $2, $3, $4, $5)",
+    [id, event.type, event.severity, event.message, photoData]
+  );
+}
