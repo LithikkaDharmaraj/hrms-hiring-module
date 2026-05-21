@@ -1,0 +1,628 @@
+import type { Interview, TranscriptEntry } from "./store";
+
+function escapeRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Cleans Alex's spoken output and corrects truncated name variants
+function cleanSpeechOutput(text: string, firstName?: string): string {
+  let s = text
+    .replace(/\s+/g, " ")
+    .replace(/([.!?])\s+([a-z])/g, (_, p, c) => `${p} ${c.toUpperCase()}`) // capitalise after sentence end
+    .replace(/([.!?])([A-Z])/g, "$1 $2")           // space after sentence end
+    .replace(/,\s*,/g, ",")                          // double commas
+    .replace(/\.\s*\./g, ".")                        // double periods
+    .replace(/\s+([,?.!])/g, "$1")                  // space before punctuation
+    .replace(/,([^\s])/g, ", $1")                   // missing space after comma
+    .replace(/\b(\w+) \1\b/gi, "$1")               // duplicate consecutive words
+    .trim();
+
+  // Fix truncated name: if firstName is e.g. "Nihaarika", replace vocative use of any
+  // shorter prefix ("Ni", "Niha", etc.) that the model incorrectly shortened it to.
+  if (firstName && firstName.length > 3) {
+    for (let len = 2; len < firstName.length; len++) {
+      const prefix = escapeRegex(firstName.substring(0, len));
+      // Only fix when used as a direct address: ", Prefix." / ", Prefix," / "Prefix," at start
+      s = s.replace(
+        new RegExp(`(,\\s+|^)${prefix}(?=[.,!?]|\\s|$)`, "gi"),
+        (_, pre) => pre + firstName
+      );
+    }
+  }
+
+  return s;
+}
+
+export function stripThinking(text: string): string {
+  // This model (kimi/Open-Thinking) dumps reasoning into content.
+  // Pattern: reasoning block (multi-paragraph), then the actual spoken response.
+  // The actual response is usually the LAST paragraph that sounds like speech.
+
+  let cleaned = text.trim();
+
+  // Remove XML thinking tags (paired and unpaired)
+  cleaned = cleaned.replace(/<(?:think|thinking|reasoning|thought)[\s\S]*?<\/(?:think|thinking|reasoning|thought)>/gi, "");
+  cleaned = cleaned.replace(/<(?:think|thinking|reasoning|thought)>[\s\S]*/gi, "");
+  // Remove stray closing tags (model sometimes only leaks </think> into content)
+  cleaned = cleaned.replace(/<\/(?:think|thinking|reasoning|thought)>/gi, "");
+  // Remove everything before a closing think tag (content starts after it)
+  cleaned = cleaned.replace(/^[\s\S]*?<\/(?:think|thinking|reasoning|thought)>\s*/i, "");
+
+  // First check if response has obvious thinking markers
+  const hasThinkingMarkers = /<think|^\d+\.\s*(NOT|I'm |First|Then)/mi.test(cleaned);
+  if (!hasThinkingMarkers) {
+    // No thinking detected — return as-is (just clean XML tags)
+    // Final cleanup: remove stray formatting
+    cleaned = cleaned.replace(/\*\*/g, "").replace(/^#+\s*/gm, "").trim();
+    return cleaned || text.trim();
+  }
+
+  // Split into paragraphs
+  const paragraphs = cleaned.split(/\n\n+/).map(p => p.trim()).filter(Boolean);
+
+  // Only apply aggressive paragraph filtering when thinking is detected
+  const isThinking = (p: string): boolean => {
+    // Numbered lists (1. Do X, 2. Do Y)
+    if (/^\d+\.\s/.test(p) && /\d+\.\s/.test(p)) return true;
+    // Starts with thinking keywords
+    if (/^(?:The user|I need|I should|Let me|Wait|My |Key |Current|Constraint|Remember|Note|The candidate|Plan|Step)/i.test(p)) return true;
+    // Contains meta-commentary markers
+    if (/(?:I need to|I should|Let me|constraints? check|meta-commentary|thinking tag|reasoning|spoken via TTS|system prompt)/i.test(p)) return true;
+    // Bullet/dash lists about rules
+    if (/^[-*]\s/.test(p)) return true;
+    return false;
+  };
+
+  const spokenParagraphs = paragraphs.filter(p => !isThinking(p));
+
+  if (spokenParagraphs.length > 0) {
+    cleaned = spokenParagraphs.join("\n\n").trim();
+  }
+
+  // Final cleanup: remove stray formatting
+  cleaned = cleaned.replace(/\*\*/g, "").replace(/^#+\s*/gm, "").trim();
+
+  return cleaned || text.trim();
+}
+
+function getDomainGuidance(role: string): string {
+  const r = role.toLowerCase();
+
+  if (r.includes("hr") || r.includes("human resource") || r.includes("talent") || r.includes("recruiter")) {
+    return `You are interviewing for an HR role. Focus on: employment law knowledge, conflict resolution, employee engagement strategies, HR metrics, onboarding processes, performance management, diversity & inclusion initiatives. Ask about real situations they've handled.`;
+  }
+  if (r.includes("ops") || r.includes("operations") || r.includes("supply chain") || r.includes("logistics")) {
+    return `You are interviewing for an Operations role. Focus on: process optimization, SOP creation, vendor management, KPI tracking, cost reduction, resource planning, cross-team coordination. Ask about measurable impact they've driven.`;
+  }
+  if (r.includes("cx") || r.includes("customer") || r.includes("support") || r.includes("success")) {
+    return `You are interviewing for a Customer Experience role. Focus on: customer empathy, handling escalations, CSAT/NPS improvement, SLA management, communication skills, conflict de-escalation, product feedback loops. Use role-play scenarios.`;
+  }
+  if (r.includes("sales") || r.includes("business development") || r.includes("bd")) {
+    return `You are interviewing for a Sales/BD role. Focus on: sales methodology, pipeline management, objection handling, negotiation skills, client relationship building, revenue targets, market analysis. Ask for specific deal stories.`;
+  }
+  if (r.includes("marketing") || r.includes("growth") || r.includes("brand")) {
+    return `You are interviewing for a Marketing role. Focus on: campaign strategy, channel expertise, ROI measurement, content strategy, brand positioning, data-driven decisions, A/B testing. Ask about campaigns they've run and results.`;
+  }
+  if (r.includes("product") || r.includes("pm") || r.includes("product manager")) {
+    return `You are interviewing for a Product Management role. Focus on: prioritization frameworks, user research, metrics definition, stakeholder management, roadmap planning, trade-off decisions, go-to-market strategy. Ask about products they've shipped.`;
+  }
+  if (r.includes("design") || r.includes("ux") || r.includes("ui")) {
+    return `You are interviewing for a Design role. Focus on: design process, user research, usability testing, design systems, accessibility, visual hierarchy, prototyping, cross-functional collaboration. Ask them to walk through their design decisions.`;
+  }
+  if (r.includes("data") || r.includes("analyst") || r.includes("analytics") || r.includes("bi")) {
+    return `You are interviewing for a Data/Analytics role. Focus on: SQL proficiency, data modeling, statistical analysis, visualization, business impact of insights, A/B testing, ETL pipelines, stakeholder communication. Ask about insights that drove business decisions.`;
+  }
+  if (r.includes("manager") || r.includes("lead") || r.includes("director") || r.includes("head")) {
+    return `You are interviewing for a Management role. Focus on: team building, performance management, strategic thinking, conflict resolution, hiring decisions, cross-functional leadership, communication up and down, handling underperformers. Ask about tough leadership moments.`;
+  }
+  if (r.includes("intern") || r.includes("fresher") || r.includes("graduate") || r.includes("trainee")) {
+    return `You are interviewing an Intern/Entry-level candidate. Be encouraging and patient. Focus on: fundamentals, learning ability, academic projects, enthusiasm, problem-solving approach, teamwork, communication. Don't expect production experience. Ask about projects and what they learned.`;
+  }
+  if (r.includes("finance") || r.includes("accounting") || r.includes("ca") || r.includes("cfo")) {
+    return `You are interviewing for a Finance role. Focus on: financial analysis, budgeting, forecasting, compliance, audit experience, cost control, financial reporting, risk management. Ask about real financial decisions and their impact.`;
+  }
+  // Default: technical
+  return `You are interviewing for a technical role. Focus on: coding ability, system design, debugging skills, architecture decisions, scalability, performance optimization, testing, code quality. Probe for real production experience.`;
+}
+
+function getLevelCalibration(level: string): string {
+  switch (level.toLowerCase()) {
+    case "intern":
+    case "fresher":
+      return `LEVEL CALIBRATION (Intern/Fresher):
+- Ask basic conceptual questions, not production-scale problems
+- Focus on fundamentals, academic projects, learning ability
+- Be encouraging — don't grill them on things they haven't been exposed to
+- Ask "What did you learn from this?" more than "What would you do differently?"
+- Acceptable: textbook answers, enthusiasm, clear thinking process
+- Red flag: inability to explain basic concepts they claim to know`;
+
+    case "junior":
+      return `LEVEL CALIBRATION (Junior):
+- Ask practical coding/work questions at a moderate level
+- Expect 1-2 years of hands-on experience
+- They should know basics well but may lack depth on architecture
+- Ask about their contributions to team projects, not just solo work
+- Acceptable: some gaps in system design, strong fundamentals
+- Red flag: can't explain their own code or project decisions`;
+
+    case "mid":
+      return `LEVEL CALIBRATION (Mid-level):
+- Expect solid technical skills and ability to work independently
+- Should be able to design small-to-medium systems
+- Ask about tradeoffs, debugging approaches, code reviews
+- They should own features end-to-end
+- Acceptable: needs guidance on large-scale architecture
+- Red flag: can't debug independently, no ownership of shipped features`;
+
+    case "senior":
+      return `LEVEL CALIBRATION (Senior):
+- Expect deep expertise, strong system design, and mentorship ability
+- Should articulate complex tradeoffs clearly
+- Ask about scaling, failure modes, cross-team impact
+- They should have owned significant projects or systems
+- Push hard on "why" and "what went wrong" — seniors should handle pressure
+- Red flag: surface-level answers, can't explain architecture of systems they built`;
+
+    case "staff":
+    case "principal":
+      return `LEVEL CALIBRATION (Staff/Principal):
+- Expect company-wide technical impact and strategic thinking
+- Ask about architectural decisions that affected multiple teams
+- They should demonstrate technical vision and influence without authority
+- Probe: how did you convince others? What was the long-term impact?
+- Expect them to identify problems YOU haven't asked about
+- Red flag: only talks about individual contributions, no cross-org impact`;
+
+    case "manager":
+    case "director":
+      return `LEVEL CALIBRATION (Manager/Director):
+- Focus on leadership, team building, strategic thinking, and execution
+- Ask about hiring decisions, performance management, conflict resolution
+- They should demonstrate both technical credibility and people skills
+- Probe: how do you handle underperformers? How do you set team direction?
+- Expect data-driven decision making and stakeholder management
+- Red flag: micromanagement tendencies, can't delegate, no team growth stories`;
+
+    default:
+      return `LEVEL CALIBRATION: Adjust difficulty based on the candidate's experience as shown in their resume.`;
+  }
+}
+
+function extractCandidateName(resume: string): string {
+  if (!resume || resume.length < 10) return "";
+  // First line of resume is usually the name
+  const firstLine = resume.split("\n").find(l => l.trim().length > 0)?.trim() || "";
+  // Heuristic: if first line is 2-4 words, all capitalized or title case, it's likely a name
+  const words = firstLine.split(/\s+/);
+  if (words.length >= 1 && words.length <= 5 && !firstLine.includes("@") && !firstLine.includes("http") && !firstLine.includes(":")) {
+    return firstLine;
+  }
+  // Try to find name from email pattern
+  const emailMatch = resume.match(/([a-zA-Z]+(?:\.[a-zA-Z]+)?)@/);
+  if (emailMatch) {
+    return emailMatch[1].replace(/\./g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  }
+  return "";
+}
+
+function buildSystemPrompt(interview: Interview): string {
+  const focusStr = interview.focusAreas.join(", ");
+  const domainGuidance = getDomainGuidance(interview.role);
+  const levelCalibration = getLevelCalibration(interview.level);
+  const minPerArea = Math.floor(interview.duration / (interview.focusAreas.length || 1));
+  const candidateName = (interview as any).candidateName || extractCandidateName(interview.resume || "");
+  const firstName = candidateName ? candidateName.split(" ")[0] : "";
+
+  const nameRule = firstName
+    ? `[NAME RULE — ABSOLUTE, NO EXCEPTIONS]
+The candidate's name is: "${firstName}"
+- Spell it EXACTLY as written above, character by character. Never shorten, truncate, or guess.
+- Use the name ONLY TWICE in the entire interview: once in your opening greeting, once in your closing farewell.
+- Do NOT use the name at any other point during the interview — not mid-conversation, not as acknowledgement.
+- Opening example: "Hi ${firstName}, I'm Alex. Let's get started."
+- Closing example: "Thank you, ${firstName}. It was great speaking with you."
+- If the STT transcript spells the name differently, IGNORE it. Always use "${firstName}" from this rule.
+[END NAME RULE]`
+    : "";
+
+  const atsRaw = (interview as any).atsResult as Record<string, any> | null | undefined;
+  let atsSection = "";
+  if (atsRaw) {
+    const atsScore = (interview as any).atsScore;
+    const atsLabel = (interview as any).atsLabel;
+    const matchedSkills: string[] = atsRaw.matched_skills || [];
+    const missingSkills: string[] = atsRaw.missing_skills || [];
+    const focus = atsRaw.interview_focus as {
+      must_probe?: string[];
+      strengths_to_confirm?: string[];
+      suggested_question_themes?: string[];
+      recommended_depth?: string;
+    } | null | undefined;
+
+    atsSection = `\n\nATS PRE-SCREEN RESULTS (use these to calibrate your interview depth and focus):
+- ATS Score: ${atsScore}/100 (${atsLabel})${matchedSkills.length ? `\n- Confirmed skills: ${matchedSkills.join(", ")}` : ""}${missingSkills.length ? `\n- Skill gaps to probe: ${missingSkills.join(", ")}` : ""}`;
+
+    if (focus) {
+      if (focus.must_probe?.length) {
+        atsSection += `\n- MUST probe these gaps (mandatory question areas): ${focus.must_probe.join("; ")}`;
+      }
+      if (focus.strengths_to_confirm?.length) {
+        atsSection += `\n- Claimed strengths to verify: ${focus.strengths_to_confirm.join("; ")}`;
+      }
+      if (focus.suggested_question_themes?.length) {
+        atsSection += `\n- Suggested question themes: ${focus.suggested_question_themes.join("; ")}`;
+      }
+      if (focus.recommended_depth) {
+        atsSection += `\n- Recommended interview depth: ${focus.recommended_depth}`;
+      }
+    }
+  }
+
+  return `${nameRule ? nameRule + "\n\n" : ""}You are Alex, a senior interviewer conducting a ${interview.duration} minute interview for a ${interview.level} ${interview.role} position. Focus areas: ${focusStr}.${atsSection}
+
+${domainGuidance}
+
+${levelCalibration}
+
+SPEECH-TO-TEXT AWARENESS:
+- The candidate's responses come through speech-to-text (STT) which often mishears words
+- Common STT errors: similar-sounding words get swapped (e.g., "trainer" instead of "drainer", "ports" instead of "pods", "ENB" instead of "env")
+- NEVER judge the candidate on word-level mistakes — always interpret the INTENT and MEANING behind what they said
+- If a word seems wrong but the concept makes sense with a similar-sounding word, assume the correct word
+- Focus on whether the candidate understands the CONCEPT, not whether STT captured every word perfectly
+
+OUTPUT RULES (strict):
+- Your entire output will be spoken aloud via text-to-speech
+- Reply with ONLY what you would say as a human interviewer
+- Keep responses SHORT and CONCISE: 1-3 sentences normally. A brief reaction + one clear question.
+- Ask ONE complete question at a time. The question must be self-contained — the candidate should understand exactly what you're asking without needing to ask "what do you mean?"
+- Good: "Tell me about a time you had to debug a production issue under pressure. What was the problem and how did you approach it?"
+- Bad: "So, tell me about debugging." (too vague, incomplete)
+- Bad: "Can you walk me through your experience with distributed systems, and also how you handle monitoring, and what tools you use?" (too many questions at once)
+- If the candidate asks for clarification, give a clear explanation (up to 4-5 sentences), then re-ask in simpler terms.
+- ALWAYS use line breaks to separate distinct items, groups, rules, or steps. Never put multiple groups or rules on the same line.
+- Use "- " prefix for lists of rules, options, or steps
+- Use "|" separated columns for tabular data (groups, comparisons)
+- Use "Label:" prefix for labeled items (Group A:, Step 1:, Rule 1:)
+- Example of GOOD formatting for groups:
+  Group A: A1, A2, A3, A4, A5
+  Group B: B1, B2, B3, B4, B5
+  (each group on its own line)
+- The transcript renders line breaks, lists, and tables visually. TTS strips them and speaks naturally.
+- Do NOT use markdown symbols like **, ##, or code blocks
+- No meta-commentary about what you are doing
+- NEVER repeat yourself. Check the conversation history — if you already greeted or asked something, move forward, don't repeat it.
+
+GRAMMAR RULES (your output must follow these exactly):
+- Write in complete, grammatically correct sentences. Subject + verb + object. No fragments.
+- Every sentence must end with a period, question mark, or exclamation mark.
+- Use a comma before coordinating conjunctions joining two independent clauses: "I understand, and that's a good point."
+- When addressing someone directly, always use a comma before their name: "Thank you, Alex." not "Thank you Alex."
+- Do not start a sentence with a conjunction like "And", "But", "So" unless it is intentional for conversational flow.
+- Do not run two sentences together without punctuation between them.
+- Use contractions naturally: "that's", "it's", "let's" — this sounds more conversational than formal equivalents.
+
+QUESTION PRIORITY (follow this order):
+1. FIRST: If a question bank was provided, ask those questions first — they are the interviewer's priority questions
+2. SECOND: Ask questions based on the candidate's resume — probe their specific past experience
+3. THIRD: Ask general questions for the role and focus areas
+Always mix in follow-up questions between main questions to dig deeper.
+
+INTERVIEW STRATEGY:
+- Opening: greet the candidate by name, introduce yourself as Alex, then ask one opening question to begin. Example: "Hi ${firstName || "there"}, I'm Alex. Let's get started — could you briefly walk me through your background?"
+- After intro: start with question bank questions (if provided), weave in resume-based questions
+- React naturally before asking the next question ("That makes sense", "Interesting", "I see")
+- Signal topic transitions: "Great, let's switch gears to system design" or "Now I'd like to explore..."
+
+ADAPTIVE DEPTH (this is critical — behave like a real interviewer):
+- START EASY: Begin each topic with a straightforward question to gauge baseline knowledge
+- RAMP UP: If the candidate answers well, go deeper. Ask about edge cases, tradeoffs, failure modes.
+- CHALLENGE WRONG ANSWERS: If something is incorrect, use YOUR OWN knowledge to verify. Push back gently: "Hmm, are you sure about that? I believe it works differently — what would happen if..." or "That's interesting, but wouldn't that cause X issue?"
+- VERIFY UNDERSTANDING: If the candidate's answer sounds off, ask them to confirm: "Just to make sure I understood correctly, you're saying X causes Y?" — this gives them a chance to self-correct
+- USE YOUR INTELLIGENCE: You have deep technical/domain knowledge. If the candidate says something factually wrong, don't just accept it — challenge it. But do it respectfully, like a senior colleague would.
+- DON'T GIVE ANSWERS: Never correct the candidate directly. Guide them with hints: "Think about what happens at scale" or "Consider the consistency implications"
+- PROBE VAGUE ANSWERS: If an answer is surface-level, dig in: "Can you walk me through a specific example?" or "What was the actual outcome in numbers?"
+- RECOGNIZE DEPTH: If the candidate demonstrates real expertise (specific numbers, real production stories, tradeoff analysis), acknowledge it and move on — don't over-drill
+- MOVE ON WHEN NEEDED: If the candidate gives 2 wrong/weak answers on the same topic, don't keep pushing. Say "Okay, let's move on to something different" and switch topics. Don't waste time on dead ends — use it to find areas where the candidate IS strong
+- STUCK CANDIDATES: Give 1 hint or rephrase the question. If still stuck, move on immediately. Every minute counts.
+- PROGRESSIVE DIFFICULTY: Easy → Medium → Hard within each focus area. Stop escalating when you find the candidate's ceiling
+
+FOLLOW-UP TECHNIQUES (use these naturally):
+- "What would you do differently if you had to do it again?"
+- "How did you handle the tradeoff between X and Y?"
+- "What broke? How did you debug it?"
+- "If this needed to scale 10x, what would change?"
+- "Tell me about a time this approach failed"
+- "What was the most surprising thing you learned?"
+
+TIME MANAGEMENT:
+- This is a ${interview.duration} minute interview. You have limited time — use it wisely.
+- You have ${interview.focusAreas.length} focus areas with ~${minPerArea} min each. Don't spend too long on one area.
+- Aim for 2-3 questions per focus area (including follow-ups). Move on when you have enough signal.
+- If a candidate gives a strong, detailed answer, acknowledge it and move to the next topic.
+- When time is running low, signal it naturally: "We're running short on time, let me ask one more thing..."
+- With 2-3 minutes left, wrap up professionally. Do NOT ask "do you have questions for me" — you are an AI and cannot answer questions about the company, team, or role. Instead say something like: "That's all the time we have. Thank you for your time. It was great speaking with you, and the team will review your responses and get back to you soon."
+- NEVER end abruptly. Always give a warm, professional closing.
+- NEVER claim to know about the company culture, team structure, benefits, or anything not in the resume/question bank. If the candidate asks, say: "Great question, but I don't have those details. The hiring team will be happy to answer that in the next round."
+
+ENDING THE INTERVIEW:
+- When you are ready to close the interview (time is up, or you have enough signal on all areas), add [END_INTERVIEW] at the very end of your closing message.
+- Example: "Thank you for your time, it was great speaking with you. The team will review and get back soon. [END_INTERVIEW]"
+- The [END_INTERVIEW] tag will NOT be spoken — it signals the system to end the interview.
+- Only use [END_INTERVIEW] ONCE, in your final closing message. Never use it mid-interview.`;
+}
+
+function buildResumeContext(interview: Interview): string {
+  const resume = interview.resume?.substring(0, 5000) || "No resume provided.";
+  return `Here is the candidate's resume. After asking question bank questions, use this resume to ask specific, targeted follow-ups about their past work:\n\n${resume}`;
+}
+
+async function callJuspayAI(
+  messages: { role: string; content: string }[],
+  maxTokens = 300,
+  temperature = 0.7
+): Promise<string> {
+  const controller = new AbortController();
+  const timeoutMs = maxTokens > 1000 ? 60000 : 12000; // 60s for scorecard, 12s for interview
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  const res = await fetch(`${process.env.AI_BASE_URL}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.AI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: process.env.AI_MODEL || "kimi-latest",
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+      ...((process.env.AI_MODEL || "").includes("minimax") ? { thinking: { type: "disabled" } } : {}),
+    }),
+    signal: controller.signal,
+  });
+  clearTimeout(timeout);
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`AI API error: ${res.status} ${err}`);
+  }
+
+  const data = await res.json();
+  // IMPORTANT: only read `content`, NOT `reasoning_content`.
+  // M2.5 returns both fields — content is the real response, reasoning_content
+  // is the model's internal thinking. We must not speak the thinking.
+  const content = data.choices?.[0]?.message?.content || "";
+  return stripThinking(content);
+}
+
+export function buildInterviewPrompt(
+  interview: Interview,
+  transcript: TranscriptEntry[]
+): { role: string; content: string }[] {
+  // Calculate time remaining
+  let timeNote = "";
+  if (interview.startedAt) {
+    const elapsedMin = Math.floor((Date.now() - new Date(interview.startedAt).getTime()) / 60000);
+    const remaining = Math.max(0, interview.duration - elapsedMin);
+    if (remaining <= 2) {
+      timeNote = `\n\nTIME STATUS: Only ${remaining} minute(s) left. Wrap up NOW — thank the candidate warmly and close the interview. Do NOT ask if they have questions (you cannot answer company-related questions).`;
+    } else if (remaining <= 5) {
+      timeNote = `\n\nTIME STATUS: About ${remaining} minutes remaining. Start wrapping up — finish your current topic, then move to closing.`;
+    } else {
+      timeNote = `\n\nTIME STATUS: About ${remaining} minutes remaining out of ${interview.duration}. ${elapsedMin < 2 ? "Interview just started." : "Pace yourself across remaining focus areas."}`;
+    }
+  }
+
+  const messages: { role: string; content: string }[] = [
+    { role: "system", content: buildSystemPrompt(interview) + timeNote },
+    { role: "user", content: buildResumeContext(interview) },
+    { role: "assistant", content: "Got it, I have the resume. Ready to begin the interview." },
+  ];
+
+  // M2.5 has 256K context — we have plenty of room. Only trim very long
+  // sessions (>200 messages ≈ ~2 hours). Keep first 10 (intro context) + last 190.
+  const trimmedTranscript = transcript.length > 200
+    ? [...transcript.slice(0, 10), ...transcript.slice(-190)]
+    : transcript;
+
+  for (const entry of trimmedTranscript) {
+    messages.push({
+      role: entry.role === "ai" ? "assistant" : "user",
+      content: entry.text,
+    });
+  }
+
+  if (transcript.length === 0) {
+    messages.push({ role: "user", content: "Start the interview now." });
+  }
+
+  return messages;
+}
+
+export async function getAIResponse(
+  interview: Interview,
+  transcript: TranscriptEntry[]
+): Promise<string> {
+  const firstName = ((interview as any).candidateName || "").split(" ")[0] || "";
+  const raw = await callJuspayAI(buildInterviewPrompt(interview, transcript), 500, 0.5);
+  return cleanSpeechOutput(raw, firstName);
+}
+
+export async function generateScorecard(interview: Interview): Promise<string> {
+  const transcriptText = interview.transcript
+    .map((e) => `${e.role === "ai" ? "Interviewer" : "Candidate"}: ${e.text}`)
+    .join("\n\n");
+
+  const proctoringText = interview.proctoring.length > 0
+    ? interview.proctoring.map((e) => `[${e.severity.toUpperCase()}] ${e.type}: ${e.message} at ${e.timestamp}`).join("\n")
+    : "No proctoring issues detected.";
+
+  const levelBar = getLevelCalibration(interview.level);
+  const candidateName = extractCandidateName(interview.resume || "") || "the candidate";
+
+  const interviewDurationMin = interview.duration;
+  const transcriptMessages = interview.transcript.length;
+  const candidateMessages = interview.transcript.filter(e => e.role === "candidate").length;
+
+  const scorecardPrompt = `You are a senior hiring evaluator for Indian companies. You are evaluating a candidate for a ${interview.level} ${interview.role} position. Candidate: ${candidateName}. Focus areas: ${interview.focusAreas.join(", ")}.
+
+INTERVIEW CONTEXT:
+- This was a ${interviewDurationMin}-minute AI voice interview conducted via speech-to-text (STT)
+- Total exchanges: ${transcriptMessages} messages (${candidateMessages} from candidate)
+- The candidate had limited time to cover ${interview.focusAreas.length} focus areas (~${Math.floor(interviewDurationMin / (interview.focusAreas.length || 1))} min each)
+- Judge the candidate on what they COULD cover in the available time, not on topics that weren't reached
+- This was likely the candidate's FIRST AI interview — factor in nervousness and unfamiliarity with the format
+
+CRITICAL — SPEECH-TO-TEXT (STT) AWARENESS:
+- The transcript was generated by speech-to-text, NOT typed by the candidate
+- STT frequently mishears technical terms, Indian names, and similar-sounding words
+- Examples: "trainer"="drainer", "ports"="pods", "ENB"="env", "MNCB"="KV", "ready stream"="Redis stream", "Namma Yatri"="Nam May Atri"
+- NEVER penalize for word-level STT errors — interpret INTENT, not literal text
+- Indian English patterns are NOT errors: "I am having experience", "I did my BTech from", "Actually...", "Basically...", "haan", "accha"
+- Filler words ("so", "like", "I mean", "basically", "actually") are natural in spoken Indian English
+- Mixing Hindi/regional words is normal — "matlab" means "meaning", "haan" means "yes"
+
+IMPORTANT — INDIAN INTERVIEW CULTURE:
+- Indian candidates often provide context before the answer (circular storytelling) — this is cultural, not poor communication
+- Saying "sir/ma'am" to the interviewer is respectful, not weakness
+- Starting answers with "Actually..." or "Basically..." is a cultural speech habit, not hedging
+- Nervousness in first 5 minutes is expected — if the candidate improves over the interview, weight later answers higher
+- Service company (TCS/Infosys/Wipro) experience is valid — don't dismiss it vs product company experience
+- Tier-2/3 college candidates may have stronger practical skills despite less polished communication
+
+IMPORTANT: Score relative to the ${interview.level} level bar.
+
+${levelBar}
+
+SCORING RUBRIC (score RELATIVE to ${interview.level} ${interview.role} bar):
+- 5 = Exceptional. Deep expertise beyond level expectations. Specific production examples, tradeoffs discussed, shows real ownership.
+- 4 = Strong. Solid depth, real experience (not textbook). Meets the bar comfortably. Clear understanding with examples.
+- 3 = Adequate. Correct but surface-level. Lacks specifics or depth. Meets minimum expectations.
+- 2 = Below bar. Significant gaps. Vague or generic answers. Would need substantial ramp-up.
+- 1 = Far below bar. Cannot answer basic expected questions. Fundamental gaps.
+
+EVALUATION CRITERIA — scored relative to ${interview.level} ${interview.role} expectations:
+${(() => {
+  const r = interview.role.toLowerCase();
+  const isEng = r.includes("engineer") || r.includes("developer") || r.includes("sde") || r.includes("backend") || r.includes("frontend") || r.includes("fullstack");
+  const isSales = r.includes("sales") || r.includes("bd") || r.includes("business development");
+  const isHR = r.includes("hr") || r.includes("human resource") || r.includes("talent") || r.includes("recruiter");
+  const isPM = r.includes("product") || r.includes("pm");
+  const isDesign = r.includes("design") || r.includes("ux");
+  const isData = r.includes("data") || r.includes("analyst");
+  const isOps = r.includes("ops") || r.includes("operations") || r.includes("supply chain");
+  const isMgr = r.includes("manager") || r.includes("director") || r.includes("lead") || r.includes("head");
+
+  if (isSales) return `- technicalDepth (Sales Methodology): pipeline management, objection handling, negotiation, CRM usage, deal closing skills
+- communication: clarity in presenting value props, storytelling, persuasion under pressure
+- problemSolving: handling objections, adapting pitch to customer needs, creative deal structuring
+- domainKnowledge: industry/product knowledge, competitive landscape, buyer personas
+- cultureFit: resilience, ownership of targets, coachability, team collaboration`;
+  if (isHR) return `- technicalDepth (HR Expertise): employment law, HRMS tools, HR policies, compliance, talent analytics
+- communication: empathy, clarity in sensitive conversations, written/verbal professionalism
+- problemSolving: conflict resolution, employee relations, HRBP decision-making
+- domainKnowledge: recruiting funnels, performance management, engagement frameworks
+- cultureFit: people-first mindset, confidentiality, integrity, collaborative leadership`;
+  if (isPM) return `- technicalDepth (Product Thinking): prioritization frameworks, metrics definition, PRD writing, roadmap planning
+- communication: stakeholder alignment, storytelling with data, presenting tradeoffs
+- problemSolving: ambiguity handling, user research synthesis, go-to-market decisions
+- domainKnowledge: domain expertise, competitive positioning, user journey mapping
+- cultureFit: ownership mindset, customer empathy, cross-functional influence`;
+  if (isDesign) return `- technicalDepth (Design Craft): design systems, accessibility, visual hierarchy, interaction patterns, prototyping tools
+- communication: articulating design decisions, receiving feedback, presenting to stakeholders
+- problemSolving: user research synthesis, design iteration, usability trade-offs
+- domainKnowledge: UX principles, typography, color theory, platform conventions
+- cultureFit: curiosity, user empathy, openness to critique, cross-team collaboration`;
+  if (isData) return `- technicalDepth (Analytics): SQL depth, data modeling, statistical methods, ML basics if relevant
+- communication: translating insights to business language, presenting findings to non-technical stakeholders
+- problemSolving: hypothesis formulation, A/B testing rigor, root cause analysis
+- domainKnowledge: tools (Tableau, dbt, Spark), metric design, business context
+- cultureFit: intellectual curiosity, data integrity, business impact orientation`;
+  if (isOps) return `- technicalDepth (Operations): SOP creation, process mapping, lean/six sigma concepts, vendor management
+- communication: cross-functional coordination, clear written documentation
+- problemSolving: root cause analysis, resource planning, cost optimization
+- domainKnowledge: supply chain/logistics/warehouse depending on role, KPI frameworks
+- cultureFit: execution mindset, reliability, continuous improvement attitude`;
+  if (isMgr) return `- technicalDepth (Leadership Depth): strategic thinking, portfolio management, organizational design
+- communication: executive presence, managing up and down, difficult conversations
+- problemSolving: handling underperformers, cross-org conflict, resource trade-offs
+- domainKnowledge: domain expertise matching the team they manage
+- cultureFit: servant leadership, accountability, talent development, decision-making speed`;
+  // Default: engineering
+  return `- technicalDepth: system design, coding depth, architecture understanding, scalability reasoning. Real production examples with numbers = 4-5.
+- communication: clarity in explaining technical concepts VERBALLY. Do NOT judge Indian English grammar. Judge by: can you understand their point?
+- problemSolving: breaking down unfamiliar problems, edge cases, failure modes. If they raised issues you didn't ask about, strong positive signal.
+- domainKnowledge: language/framework expertise, tools, industry context relevant to ${interview.role}
+- cultureFit: ownership, curiosity, honesty about gaps. Proctoring flags go in proctoringNotes ONLY.`;
+})()}
+Proctoring flags go in proctoringNotes ONLY — do NOT reduce cultureFit for proctoring issues.
+
+SCORING APPROACH:
+1. SUBSTANCE over DELIVERY — a technically correct but poorly transcribed answer is still a good answer
+2. Look for PROGRESSION — if the candidate started nervous but improved, weight later answers higher
+3. Experience-backed answers with real numbers/tradeoffs = 4-5
+4. Textbook answers without real examples = 2-3
+5. Identifying edge cases or failure modes unprompted = strong positive signal
+6. If the candidate clearly knows the concept but STT garbled their explanation, give benefit of doubt
+7. Short answers are fine if they're correct and to the point — don't penalize brevity
+
+ROLE-BASED DIMENSION WEIGHTAGE (use these weights when calculating overall score):
+${(() => {
+  const r = interview.role.toLowerCase();
+  if (r.includes("sde") || r.includes("engineer") || r.includes("developer") || r.includes("backend") || r.includes("frontend") || r.includes("fullstack"))
+    return "- technicalDepth: 35%, problemSolving: 25%, domainKnowledge: 20%, communication: 10%, cultureFit: 10%\n- A tech person with lower communication but strong technical skills is still a HIRE";
+  if (r.includes("product") || r.includes("pm"))
+    return "- problemSolving: 25%, communication: 25%, domainKnowledge: 20%, technicalDepth: 15%, cultureFit: 15%\n- PM needs strong communication + problem solving";
+  if (r.includes("sales") || r.includes("bd"))
+    return "- communication: 35%, domainKnowledge: 20%, cultureFit: 20%, problemSolving: 15%, technicalDepth: 10%\n- Sales needs excellent communication above all";
+  if (r.includes("hr") || r.includes("human resource"))
+    return "- communication: 30%, cultureFit: 25%, domainKnowledge: 20%, problemSolving: 15%, technicalDepth: 10%\n- HR needs empathy and communication";
+  if (r.includes("design") || r.includes("ux"))
+    return "- domainKnowledge: 30%, problemSolving: 25%, communication: 20%, technicalDepth: 15%, cultureFit: 10%\n- Designers need strong domain + problem solving";
+  if (r.includes("data") || r.includes("analyst"))
+    return "- technicalDepth: 30%, domainKnowledge: 25%, problemSolving: 25%, communication: 10%, cultureFit: 10%\n- Data roles need technical + domain depth";
+  if (r.includes("manager") || r.includes("director") || r.includes("lead") || r.includes("head") || r.includes("ceo") || r.includes("cto"))
+    return "- communication: 25%, problemSolving: 25%, cultureFit: 20%, domainKnowledge: 20%, technicalDepth: 10%\n- Leaders need communication + problem solving + culture";
+  if (r.includes("ops") || r.includes("operations"))
+    return "- problemSolving: 30%, domainKnowledge: 25%, communication: 20%, technicalDepth: 15%, cultureFit: 10%\n- Ops needs strong problem solving + domain";
+  return "- technicalDepth: 25%, communication: 20%, problemSolving: 20%, domainKnowledge: 20%, cultureFit: 15%\n- Balanced weights for this role";
+})()}
+
+RECOMMENDATION GUIDE (using weighted overall):
+- strong_hire: weighted overall >= 4 AND no dimension below 3. Exceptional candidate for ${interview.level}.
+- hire: weighted overall >= 3. Meets the bar. Low scores in non-critical dimensions are OK if role-critical dimensions are strong.
+- no_hire: weighted overall < 2.5 OR role-critical dimension below 2.
+- strong_no_hire: weighted overall < 2 OR fundamental inability to answer basic questions OR clear dishonesty.
+
+EVIDENCE: For each dimension, cite a candidate quote and explain the score. Note STT errors and interpret intended meaning. Include at least 3-4 evidence items. If the candidate improved over time, note that.
+
+PROCTORING: Summarize in proctoringNotes. Phone detection and window blur can be false positives (notifications, bright objects). Be factual, not accusatory. Do not let proctoring affect scores unless there's a clear pattern of sustained cheating.
+
+## Interview Transcript
+${transcriptText}
+
+## Proctoring Events
+${proctoringText}
+
+Respond with ONLY valid JSON, no markdown, no code blocks, no explanation outside the JSON:
+{
+  "technicalDepth": <1-5>,
+  "communication": <1-5>,
+  "problemSolving": <1-5>,
+  "domainKnowledge": <1-5>,
+  "cultureFit": <1-5>,
+  "overall": <1-5 weighted average>,
+  "recommendation": "<strong_hire|hire|no_hire|strong_no_hire>",
+  "summary": "<3-4 sentence assessment covering strengths, gaps, and hiring recommendation with reasoning>",
+  "strengths": ["<specific strength with example>", "<another>"],
+  "weaknesses": ["<specific weakness with example>", "<another>"],
+  "evidence": [
+    {"dimension": "<technicalDepth|communication|problemSolving|domainKnowledge|cultureFit>", "quote": "<exact candidate quote>", "assessment": "<why this quote supports the score>"}
+  ],
+  "proctoringNotes": "<summary of integrity concerns or 'No issues detected'>"
+}`;
+
+  return callJuspayAI([{ role: "system", content: scorecardPrompt }], 4000, 0.3);
+}
