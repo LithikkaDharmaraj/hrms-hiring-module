@@ -992,7 +992,7 @@ export function InterviewRoom({ interviewId }: { interviewId: string }) {
     [interviewId, runtimeConfig.maxProctoringStrikes]
   );
 
-  // Auto-end interview after max proctoring violations — give 10 seconds to read the message
+  // Auto-end interview after max proctoring violations — give 3 seconds to read the message
   useEffect(() => {
     if (!showProctoringBan || isEndingRef.current) return;
     const timer = setTimeout(() => {
@@ -1009,8 +1009,9 @@ export function InterviewRoom({ interviewId }: { interviewId: string }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: tokenRef.current }),
       }).catch(console.error);
-      window.location.href = `/completed/${interviewId}`;
-    }, 10000);
+      const tok = tokenRef.current ? `?token=${tokenRef.current}` : "";
+      window.location.href = `/completed/${interviewId}${tok}`;
+    }, 3000);
     return () => clearTimeout(timer);
   }, [showProctoringBan, interviewId]);
 
@@ -1752,7 +1753,7 @@ export function InterviewRoom({ interviewId }: { interviewId: string }) {
               Photos were captured during violations. This incident has been recorded and will be reviewed by the interviewer.
             </p>
             <div className="mt-4 h-1 bg-zinc-800 rounded-full overflow-hidden">
-              <div className="h-full bg-red-500 rounded-full" style={{ animation: "shrinkBar 10s linear forwards" }} />
+              <div className="h-full bg-red-500 rounded-full" style={{ animation: "shrinkBar 3s linear forwards" }} />
             </div>
           </div>
         </div>

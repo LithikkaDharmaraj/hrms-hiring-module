@@ -4,6 +4,7 @@ import { validateAccessPost } from "@/lib/auth-check";
 import { rateLimit } from "@/lib/rate-limit";
 import { pool } from "@/lib/db";
 import { getTTSProvider } from "@/lib/providers";
+import { failScoring } from "@/lib/scoring-tracker";
 
 // Clean text for TTS — remove special characters that cause TTS to speak them literally
 function cleanForTTS(text: string): string {
@@ -100,21 +101,23 @@ export async function POST(req: Request) {
           closed = true;
           try { controller.close(); } catch {}
         };
-        // AI fetch with retry — try twice with 35s timeout each
+        // AI fetch with single attempt and reasonable timeout
         const startTime = Date.now();
-        const makeAICall = async (attempt: number) => {
+        const makeAICall = async () => {
           const abort = new AbortController();
-          const timeout = setTimeout(() => abort.abort(), 35000);
-          console.log(`[Stream] AI call attempt ${attempt} for ${interviewId} (model=${process.env.AI_MODEL}, messages=${aiMessages.length})`);
+          // Reduced timeout from 35s to 15s for faster failure detection
+          const timeout = setTimeout(() => abort.abort(), 15000);
+          console.log(`[Stream] AI call for ${interviewId} (model=${process.env.AI_MODEL}, messages=${aiMessages.length})`);
           try {
-            const res = await fetch(`${process.env.AI_BASE_URL}/v1/chat/completions`, {
+            const baseUrl = process.env.AI_BASE_URL || "https://api.openai.com";
+            const res = await fetch(`${baseUrl}/v1/chat/completions`, {
               method: "POST",
               headers: {
                 Authorization: `Bearer ${process.env.AI_API_KEY}`,
                 "Content-Type": "application/json",
               },
               body: JSON.stringify({
-                model: process.env.AI_MODEL || "minimaxai/minimax-m2",
+                model: process.env.AI_MODEL || "gpt-4o",
                 messages: aiMessages,
                 max_tokens: 500,
                 temperature: 0.3,
@@ -125,11 +128,11 @@ export async function POST(req: Request) {
               signal: abort.signal,
             });
             clearTimeout(timeout);
-            console.log(`[Stream] AI call attempt ${attempt} responded in ${Date.now() - startTime}ms (status=${res.status})`);
+            console.log(`[Stream] AI call responded in ${Date.now() - startTime}ms (status=${res.status})`);
             return res;
           } catch (err) {
             clearTimeout(timeout);
-            console.error(`[Stream] AI call attempt ${attempt} failed in ${Date.now() - startTime}ms:`, (err as Error).message);
+            console.error(`[Stream] AI call failed in ${Date.now() - startTime}ms:`, (err as Error).message);
             throw err;
           }
         };
@@ -137,10 +140,10 @@ export async function POST(req: Request) {
         try {
           let aiRes;
           try {
-            aiRes = await makeAICall(1);
-          } catch (firstErr) {
-            console.warn(`[Stream] Retrying AI call for ${interviewId}...`);
-            aiRes = await makeAICall(2);
+            aiRes = await makeAICall();
+          } catch (err) {
+            console.error(`[Stream] AI call failed for ${interviewId}:`, (err as Error).message);
+            throw err;
           }
 
           if (!aiRes.ok || !aiRes.body) {
@@ -156,6 +159,7 @@ export async function POST(req: Request) {
           let fullText = "";
           let sentenceIdx = 0;
           const ttsPromises: Promise<void>[] = [];
+          let aiStreamBuffer = "";
 
           const processSentence = (sentence: string) => {
             const cleaned = stripThinking(sentence).replace(/\[END_INTERVIEW\]/g, "").trim();
@@ -190,8 +194,11 @@ export async function POST(req: Request) {
             const { done, value } = await reader.read();
             if (done) break;
 
-            const chunk = decoder.decode(value, { stream: true });
-            for (const line of chunk.split("\n")) {
+            aiStreamBuffer += decoder.decode(value, { stream: true });
+            const lines = aiStreamBuffer.split("\n");
+            aiStreamBuffer = lines.pop() || "";
+
+            for (const line of lines) {
               if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
               try {
                 const json = JSON.parse(line.slice(6));

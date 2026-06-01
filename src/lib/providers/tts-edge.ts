@@ -27,6 +27,11 @@ export class EdgeTTS implements TTSProvider {
       ], { timeout: 15000 });
 
       return await readFile(tmpFile);
+    } catch (err: any) {
+      if (err.code === "ENOENT") {
+        throw new Error("edge-tts CLI is not installed. Please run `pip install edge-tts` in your terminal.");
+      }
+      throw err;
     } finally {
       unlink(tmpFile).catch(() => {});
     }

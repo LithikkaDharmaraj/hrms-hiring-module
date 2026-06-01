@@ -5,35 +5,40 @@ export class OpenAITTS implements TTSProvider {
   contentType = "audio/mpeg";
 
   async synthesize(text: string): Promise<Buffer> {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("OPENAI_API_KEY not configured");
-    const baseUrl = "https://api.openai.com";
-    if (!text || !text.trim()) throw new Error("Empty text for TTS");
+    // Fallback to the general AI API key if a specific OpenAI key isn't provided
+    const apiKey = process.env.OPENAI_API_KEY || process.env.AI_API_KEY;
+    if (!apiKey) {
+      throw new Error("OPENAI_API_KEY or AI_API_KEY not configured for TTS");
+    }
+
+    const model = process.env.OPENAI_TTS_MODEL || "tts-1"; // or tts-1-hd for higher quality
+    const voice = process.env.OPENAI_TTS_VOICE || "nova"; // options: alloy, echo, fable, onyx, nova, shimmer
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    const timeout = setTimeout(() => controller.abort(), 15000);
 
     try {
-      const res = await fetch(`${baseUrl}/v1/audio/speech`, {
+      const res = await fetch("https://api.openai.com/v1/audio/speech", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          "Authorization": `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "gpt-4o-mini-tts",
-          input: text.trim(),
-          voice: "alloy",
-          response_format: "mp3",
+          model,
+          input: text,
+          voice,
         }),
         signal: controller.signal,
       });
 
       if (!res.ok) {
-        const errBody = await res.text().catch(() => "");
-        throw new Error(`OpenAI TTS error: ${res.status} ${errBody.substring(0, 200)}`);
+        const errorText = await res.text();
+        throw new Error(`OpenAI TTS error: ${res.status} - ${errorText}`);
       }
-      return Buffer.from(await res.arrayBuffer());
+
+      const arrayBuffer = await res.arrayBuffer();
+      return Buffer.from(arrayBuffer);
     } finally {
       clearTimeout(timeout);
     }

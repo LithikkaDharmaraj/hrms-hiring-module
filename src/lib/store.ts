@@ -1,5 +1,9 @@
 import { pool } from "./db";
 
+// Simple in-memory cache for proctoring violation counts with 5-second TTL
+const proctoringCache = new Map<string, { count: number; timestamp: number }>();
+const PROCTORING_CACHE_TTL_MS = 5000; // 5 seconds
+
 export interface AtsResult {
   score: number;
   label: string;
@@ -117,7 +121,8 @@ export async function getInterview(id: string): Promise<Interview | null> {
   if (rows.length === 0) return null;
 
   const row = rows[0];
-  const transcript = await getTranscript(id);
+  // Load only recent transcript entries (last 20) to prevent loading full history
+  const transcript = await getTranscript(id, 20);
   const proctoring = await getProctoringEvents(id);
 
   return {
@@ -161,7 +166,8 @@ export async function getInterviewWithPhotos(id: string): Promise<Interview | nu
   if (rows.length === 0) return null;
 
   const row = rows[0];
-  const transcript = await getTranscript(id);
+  // Load only recent transcript entries (last 20) to prevent loading full history
+  const transcript = await getTranscript(id, 20);
   const proctoring = await getProctoringEventsWithPhotos(id);
 
   return {
@@ -234,16 +240,19 @@ export async function updateInterview(id: string, updates: Partial<Interview>): 
   await pool.query(`UPDATE interviews SET ${setClauses.join(", ")} WHERE id = $${idx}`, values);
 }
 
-async function getTranscript(interviewId: string): Promise<TranscriptEntry[]> {
+async function getTranscript(interviewId: string, limit = 20): Promise<TranscriptEntry[]> {
   const { rows } = await pool.query(
-    "SELECT role, text, created_at FROM transcript_entries WHERE interview_id = $1 ORDER BY id ASC",
-    [interviewId]
+    "SELECT role, text, created_at FROM transcript_entries WHERE interview_id = $1 ORDER BY id DESC LIMIT $2",
+    [interviewId, limit]
   );
-  return rows.map((r) => ({
-    role: r.role as "ai" | "candidate",
-    text: r.text,
-    timestamp: r.created_at?.toISOString(),
-  }));
+  // Reverse to get chronological order (oldest first)
+  return rows
+    .reverse()
+    .map((r) => ({
+      role: r.role as "ai" | "candidate",
+      text: r.text,
+      timestamp: r.created_at?.toISOString(),
+    }));
 }
 
 async function getProctoringEvents(interviewId: string): Promise<ProctoringEvent[]> {
@@ -274,18 +283,26 @@ async function getProctoringEventsWithPhotos(interviewId: string): Promise<Proct
 }
 
 export async function getProctoringViolationCount(interviewId: string): Promise<number> {
+  // Check cache first
+  const cached = proctoringCache.get(interviewId);
+  if (cached && (Date.now() - cached.timestamp < PROCTORING_CACHE_TTL_MS)) {
+    return cached.count;
+  }
+
+  // Cache miss or expired - query database
+  // Changed to whole numbers: each violation counts as 1, removing fractional weights
   const { rows } = await pool.query(
-    `SELECT COALESCE(SUM(
-      CASE type
-        WHEN 'face_missing' THEN 0.5
-        WHEN 'eye_away' THEN 0.5
-        ELSE 1
-      END
-    ), 0) as weighted_count
-    FROM proctoring_events WHERE interview_id = $1 AND severity = 'flag'`,
+    `SELECT COUNT(*) as count
+     FROM proctoring_events
+     WHERE interview_id = $1 AND severity = 'flag'`,
     [interviewId]
   );
-  return parseFloat(rows[0].weighted_count);
+  const count = parseInt(rows[0].count);
+
+  // Update cache
+  proctoringCache.set(interviewId, { count, timestamp: Date.now() });
+
+  return count;
 }
 
 export async function getAllInterviews(orgId?: string): Promise<Omit<Interview, "resume">[]> {

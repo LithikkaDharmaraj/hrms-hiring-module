@@ -35,7 +35,7 @@ export function getTTSProvider(): TTSProvider {
 
 export function getSTTConfig(): STTConfig {
   const provider = process.env.STT_PROVIDER || "soniox";
-  const language = process.env.STT_LANGUAGE || "en-IN";
+  const language = process.env.STT_LANGUAGE || "en-US";
 
   if (provider === "soniox") {
     return {

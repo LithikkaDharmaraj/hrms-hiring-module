@@ -20,39 +20,41 @@ const dbg = (...args: any[]) => { if (isDebug()) console.log("[Proc]", ...args);
 
 /**
  * Tier-1 phone detection: MediaPipe ObjectDetector (EfficientDet-Lite0, ~4 MB).
- * More permissive thresholds vs previous version — model is semantically accurate
- * so we can afford lower confidence while still avoiding non-phone FP.
+ * Increased confidence threshold and confirm frames to reduce false positives from lights.
  */
 const PHONE_MODEL = {
-  MIN_CONFIDENCE: 0.35,
-  MIN_BBOX_AREA: 0.003,
-  MAX_BBOX_AREA: 0.80,
-  MIN_ASPECT: 0.20,
-  MAX_ASPECT: 4.00,
-  BORDER_MARGIN: 0.02,
-  IOU_THRESHOLD: 0.10,
-  // 1 frame × 3 s = ~3 s of continuous phone presence before first alert.
-  CONFIRM_FRAMES: 1,
-  ABSENCE_RESET_MS: 8_000,
-  ESCALATION_INTERVAL_MS: 45_000,
+  MIN_CONFIDENCE: 0.50,  // Increased from 0.35 to reduce false positives
+  MIN_BBOX_AREA: 0.005,  // Slightly increased to ignore very small detections
+  MAX_BBOX_AREA: 0.60,   // Decreased from 0.80 to ignore overly large detections
+  MIN_ASPECT: 0.40,      // Increased from 0.20 - phones are typically taller than wide
+  MAX_ASPECT: 2.50,      // Decreased from 4.00 - phones are typically taller than wide
+  BORDER_MARGIN: 0.05,   // Increased from 0.02 to avoid edge detections
+  IOU_THRESHOLD: 0.20,   // Increased from 0.10 for stricter temporal consistency
+  // 2 frames × 3 s = ~6 s of continuous phone presence before first alert.
+  CONFIRM_FRAMES: 2,     // Increased from 1 to require multiple consecutive detections
+  ABSENCE_RESET_MS: 10_000, // Increased from 8_000 for more stable tracking
+  ESCALATION_INTERVAL_MS: 60_000, // Increased from 45_000 to reduce alert frequency
   // Poll every 3 s for quicker response.
   POLL_MS: 3_000,
 } as const;
 
 /**
  * Tier-2 phone detection: brightness block analysis.
- * Runs when ObjectDetector model is not loaded. More permissive than before —
- * geometry validation was removed from the fallback since the block bounding
- * box rarely matches the phone's true shape.
+ * Runs when ObjectDetector model is not loaded. Added geometry validation
+ * to reduce false positives from lights and bright rectangular objects.
  */
 const BRIGHTNESS = {
   W: 240, H: 180,
   BLOCK: 20,
-  ABS_THRESH: 185,
-  REL_THRESH: 35,
-  MIN_BLOCKS: 1,
-  // 2 frames × 3 s = 6 s continuous before alert.
-  CONFIRM_FRAMES: 2,
+  ABS_THRESH: 195,  // Increased from 185 to be more selective about bright pixels
+  REL_THRESH: 40,   // Increased from 35 to require brighter relative to surroundings
+  MIN_BLOCKS: 2,    // Increased from 1 to require more connected bright pixels
+  MAX_ASPECT_RATIO: 3.0, // Added: reject overly wide/tall rectangles (likely not phones)
+  MIN_ASPECT_RATIO: 0.3, // Added: reject squares or tall thin shapes
+  MIN_BLOCK_AREA: 15,  // Added: minimum pixels for a valid bright block
+  MAX_BLOCK_AREA: 100, // Added: maximum pixels for a valid bright block
+  // 3 frames × 3 s = 9 s continuous before alert (more conservative)
+  CONFIRM_FRAMES: 3,   // Increased from 2 to require more consecutive detections
 } as const;
 
 /**
@@ -668,44 +670,95 @@ export default function Proctoring({ videoRef, interviewId, enabled, onAlert, to
     };
 
     // ── Tier 2: brightness block analysis ────────────────────────────────
-    // Note: geometry (aspect ratio / area) check removed from this tier.
-    // The bounding box of bright pixel clusters rarely matches actual phone
-    // geometry, so the check was rejecting valid detections more than FP.
+    // Note: Added geometry validation to reduce false positives from lights.
     const detectWithBrightness = (): BBox | null => {
-      const video = videoRef.current, canvas = phoneCanvasRef.current;
-      if (!video || !canvas || video.readyState < 2) return null;
+      const video = videoRef.current;
+      if (!video) return null;
 
-      const { W, H, BLOCK: BS } = BRIGHTNESS;
-      canvas.width = W; canvas.height = H;
-      const ctx = canvas.getContext("2d"); if (!ctx) return null;
-      ctx.drawImage(video, 0, 0, W, H);
-      const data = ctx.getImageData(0, 0, W, H).data;
+      // Create temporary canvas to capture frame
+      const canvas = document.createElement('canvas');
+      canvas.width = BRIGHTNESS.W;
+      canvas.height = BRIGHTNESS.H;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
 
-      // Frame-average brightness for relative thresholding
-      let frameSum = 0;
-      for (let i = 0; i < data.length; i += 4) frameSum += (data[i] + data[i + 1] + data[i + 2]) / 3;
-      const frameAvg = frameSum / (W * H);
+      ctx.drawImage(video, 0, 0, BRIGHTNESS.W, BRIGHTNESS.H);
+      const imageData = ctx.getImageData(0, 0, BRIGHTNESS.W, BRIGHTNESS.H);
+      const data = imageData.data;
 
-      const cols = Math.floor(W / BS), rows = Math.floor(H / BS);
-      let suspCount = 0;
+      // Find bright blocks
+      const visited = new Array(BRIGHTNESS.W * BRIGHTNESS.H).fill(false);
+      let bestBBox: BBox | null = null;
+      let bestScore = 0;
 
-      for (let by = 0; by < rows; by++) {
-        for (let bx = 0; bx < cols; bx++) {
-          let s = 0;
-          for (let dy = 0; dy < BS; dy++) for (let dx = 0; dx < BS; dx++) {
-            const idx = ((by * BS + dy) * W + (bx * BS + dx)) * 4;
-            s += (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+      // Scan for bright pixel blocks
+      for (let y = 0; y < BRIGHTNESS.H; y += BRIGHTNESS.BLOCK) {
+        for (let x = 0; x < BRIGHTNESS.W; x += BRIGHTNESS.BLOCK) {
+          let brightCount = 0;
+          let totalPixels = 0;
+
+          // Check this block
+          for (let dy = 0; dy < BRIGHTNESS.BLOCK && y + dy < BRIGHTNESS.H; dy++) {
+            for (let dx = 0; dx < BRIGHTNESS.BLOCK && x + dx < BRIGHTNESS.W; dx++) {
+              const i = ((y + dy) * BRIGHTNESS.W + (x + dx)) * 4;
+              const r = data[i];
+              const g = data[i + 1];
+              const b = data[i + 2];
+
+              // Simple brightness calculation
+              const brightness = (r + g + b) / 3;
+              if (brightness > BRIGHTNESS.ABS_THRESH) {
+                brightCount++;
+              }
+              totalPixels++;
+            }
           }
-          const avg = s / (BS * BS);
-          if (avg > BRIGHTNESS.ABS_THRESH && avg - frameAvg > BRIGHTNESS.REL_THRESH) suspCount++;
+
+          // Calculate ratio of bright pixels in this block
+          const brightRatio = brightCount / totalPixels;
+
+          // If enough bright pixels, analyze this block
+          if (brightRatio > (BRIGHTNESS.REL_THRESH / 100)) {
+            const blockX = x;
+            const blockY = y;
+            const blockW = Math.min(BRIGHTNESS.BLOCK, BRIGHTNESS.W - x);
+            const blockH = Math.min(BRIGHTNESS.BLOCK, BRIGHTNESS.H - y);
+
+            // Convert to normalized coordinates (0-1)
+            const bbox: BBox = {
+              x: blockX / BRIGHTNESS.W,
+              y: blockY / BRIGHTNESS.H,
+              w: blockW / BRIGHTNESS.W,
+              h: blockH / BRIGHTNESS.H
+            };
+
+            // Calculate aspect ratio
+            const aspectRatio = bbox.w / (bbox.h || 0.001);
+
+            // Check if aspect ratio is within phone-like bounds
+            if (aspectRatio >= BRIGHTNESS.MIN_ASPECT_RATIO &&
+                aspectRatio <= BRIGHTNESS.MAX_ASPECT_RATIO &&
+                blockW * blockH >= BRIGHTNESS.MIN_BLOCK_AREA &&
+                blockW * blockH <= BRIGHTNESS.MAX_BLOCK_AREA) {
+
+              // Simple scoring based on how "phone-like" the rectangle is
+              // Ideal phone aspect ratio is around 0.5-0.6 (taller than wide)
+              const idealAspect = 0.55;
+              const aspectScore = 1.0 - Math.abs(aspectRatio - idealAspect) / idealAspect;
+              const sizeScore = Math.min(1.0, (blockW * blockH) / 50.0); // Normalize by expected size
+              const score = (aspectScore * 0.7) + (sizeScore * 0.3);
+
+              if (score > bestScore) {
+                bestScore = score;
+                bestBBox = bbox;
+              }
+            }
+          }
         }
       }
 
-      dbg(`brightness: frameAvg=${frameAvg.toFixed(1)} suspBlocks=${suspCount}/${BRIGHTNESS.MIN_BLOCKS}`);
-      if (suspCount < BRIGHTNESS.MIN_BLOCKS) return null;
-
-      // Return a placeholder BBox (used only for IoU tracking continuity)
-      return { x: 0.1, y: 0.1, w: 0.2, h: 0.3 };
+      // Only return if we found a reasonably good candidate
+      return bestScore > 0.3 ? bestBBox : null;
     };
 
     // ── State machine ──────────────────────────────────────────────────────

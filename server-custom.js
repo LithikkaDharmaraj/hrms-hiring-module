@@ -5,8 +5,9 @@
 const path = require("path");
 const fs = require("fs");
 
-// Load .env.local
-const envPath = path.join(__dirname, ".env.local");
+// Load .env.local or .env
+let envPath = path.join(__dirname, ".env.local");
+if (!fs.existsSync(envPath)) envPath = path.join(__dirname, ".env");
 if (fs.existsSync(envPath)) {
   for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
     const t = line.trim();

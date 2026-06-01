@@ -219,7 +219,7 @@ export function useSTT(options: UseSTTOptions): UseSTTReturn {
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.lang = "en-IN";
+      recognition.lang = "en-US";
       recognition.maxAlternatives = 1;
 
       recognition.onstart = () => {
